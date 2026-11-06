@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# cop: delega uma tarefa ao GitHub Copilot CLI em modo não interativo e devolve só um resumo curto.
+#
+# Feito para o Claude Code chamar via Bash. A saída completa fica em log; o Claude recebe
+# no máximo COP_MAX_CHARS caracteres. Compatível com o bash 3.2 do macOS.
+
+set -euo pipefail
+
+COP_VERSION="3.0.0"
+
+usage() {
+  cat <<'EOF'
+uso: cop [opções] "tarefa"            (ou: echo "tarefa" | cop [opções])
+
+opções:
+  -w           modo escrita: edita arquivos e roda build/teste/lint (padrão: só leitura)
+  -W           escrita num git worktree isolado (implica -w); depois use --apply ou --discard
+  -R PAPEL     worker (padrão) | reviewer (revisa o diff, só leitura) | tester (só cria/edita testes)
+  -r JOB       continua a sessão do Copilot de um job anterior ("last" = o mais recente)
+  -m MODELO    modelo do Copilot (padrão: $COP_MODEL ou gpt-6-luna; "auto" deixa o Copilot escolher)
+  -e NÍVEL     reasoning effort: none|minimal|low|medium|high|xhigh|max (padrão: low)
+  -C DIR       roda no diretório DIR (padrão: diretório atual)
+  -t SEG       timeout em segundos (padrão: 540; o Bash do Claude corta em 600)
+  -h           ajuda
+
+jobs:
+  cop --jobs              últimos jobs (id, papel, modo, status, worktree)
+  cop --apply JOB         aplica as mudanças do worktree no repositório e remove o worktree
+  cop --discard JOB       descarta o worktree e a branch do job
+  cop --stats | --last | --version
+
+variáveis:
+  COP_MODEL, COP_EFFORT, COP_TIMEOUT, COP_MAX_CHARS (4000), COP_LOG_DIR, COP_WORKTREE_DIR,
+  COP_EXTRA_ALLOW ("shell(make:*) shell(./gradlew:*)"), COP_GITHUB_MCP=1
+
+saída: resumo do Copilot + linha final "[cop] job=... status=... log=..."
+códigos: 0 ok · 2 uso errado · 3 recursão bloqueada · 4 job/worktree inválido · 124 timeout ·
+         outros = código do copilot
+EOF
+}
+
+die() { echo "[cop] $2" >&2; exit "$1"; }
+
+LOG_DIR="${COP_LOG_DIR:-${TMPDIR:-/tmp}/cop-logs}"
+JOB_DIR="$LOG_DIR/jobs"
+INDEX="$LOG_DIR/index.tsv"
+COPILOT_HOME_DIR="${COPILOT_HOME:-$HOME/.copilot}"
+
+# ---------- jobs ----------
+resolve_job() {   # imprime o caminho do arquivo do job
+  local id="$1" f
+  if [ "$id" = last ]; then
+    f="$(ls -t "$JOB_DIR"/*.env 2>/dev/null | head -1 || true)"
+  else
+    f="$JOB_DIR/$id.env"
+  fi
+  [ -n "$f" ] && [ -f "$f" ] || die 4 "job não encontrado: $id (veja cop --jobs)"
+  echo "$f"
+}
+
+save_job() {
+  mkdir -p "$JOB_DIR"
+  {
+    printf 'J_ID=%q\n' "$STAMP"
+    printf 'J_SESSION=%q\n' "$SESSION"
+    printf 'J_WORKDIR=%q\n' "$RUN_DIR"
+    printf 'J_REPO=%q\n' "$REPO"
+    printf 'J_WORKTREE=%q\n' "$WT"
+    printf 'J_BRANCH=%q\n' "$BRANCH"
+    printf 'J_MODE=%q\n' "$MODE"
+    printf 'J_ROLE=%q\n' "$ROLE"
+    printf 'J_MODEL=%q\n' "$MODEL"
+    printf 'J_STATUS=%q\n' "$STATUS"
+  } >"$JOB_DIR/$STAMP.env"
+}
+
+cmd_jobs() {
+  ls "$JOB_DIR"/*.env >/dev/null 2>&1 || { echo "nenhum job ainda"; return 0; }
+  ls -t "$JOB_DIR"/*.env | head -"${1:-15}" | while read -r f; do
+    ( . "$f"; printf '%s  %-8s %-5s status=%-3s %s\n' "$J_ID" "$J_ROLE" "$J_MODE" "$J_STATUS" "${J_WORKTREE:-$J_WORKDIR}" )
+  done
+}
+
+cmd_apply() {
+  local f; f="$(resolve_job "$1")"; . "$f"
+  [ -n "$J_WORKTREE" ] && [ -d "$J_WORKTREE" ] || die 4 "o job $J_ID não tem worktree ativo"
+  git -C "$J_WORKTREE" add -A
+  if git -C "$J_WORKTREE" diff --cached --quiet HEAD; then
+    echo "[cop] o worktree não tem mudanças; nada a aplicar"
+  else
+    git -C "$J_WORKTREE" diff --cached --binary HEAD >"$LOG_DIR/$J_ID.patch"
+    git -C "$J_REPO" apply --3way "$LOG_DIR/$J_ID.patch" 2>>"$LOG_DIR/$J_ID.apply.log" \
+      || die 4 "conflito ao aplicar; o worktree foi mantido em $J_WORKTREE (patch: $LOG_DIR/$J_ID.patch)"
+    echo "[cop] mudanças aplicadas em $J_REPO (patch salvo em $LOG_DIR/$J_ID.patch):"
+    git -C "$J_REPO" diff --stat HEAD
+  fi
+  remove_worktree
+}
+
+cmd_discard() {
+  local f; f="$(resolve_job "$1")"; . "$f"
+  [ -n "$J_WORKTREE" ] || die 4 "o job $J_ID não usa worktree"
+  remove_worktree
+}
+
+remove_worktree() {
+  git -C "$J_REPO" worktree remove --force "$J_WORKTREE" 2>/dev/null || true
+  git -C "$J_REPO" branch -D "$J_BRANCH" >/dev/null 2>&1 || true
+  git -C "$J_REPO" worktree prune 2>/dev/null || true
+  sed -i.bak "s#^J_WORKTREE=.*#J_WORKTREE=''#" "$JOB_DIR/$J_ID.env" && rm -f "$JOB_DIR/$J_ID.env.bak"
+  echo "[cop] worktree removido: $J_WORKTREE"
+}
+
+case "${1:-}" in
+  --stats)
+    [ -f "$INDEX" ] || { echo "nenhuma delegação registrada ainda"; exit 0; }
+    awk -F'\t' '{n++; s[$5]++; m[$3]++; r[$8]++; t+=$6} END {
+      printf "delegações: %d · tempo total: %dmin\n", n, t/60
+      for (k in m) printf "  modelo %-20s %d\n", k, m[k]
+      for (k in r) if (k != "") printf "  papel  %-20s %d\n", k, r[k]
+      for (k in s) printf "  status %-20s %d\n", k, s[k] }' "$INDEX"
+    exit 0 ;;
+  --last) ls -t "$LOG_DIR"/*.md 2>/dev/null | head -1; exit 0 ;;
+  --jobs) cmd_jobs "${2:-15}"; exit 0 ;;
+  --apply) [ -n "${2:-}" ] || die 2 "uso: cop --apply JOB"; cmd_apply "$2"; exit 0 ;;
+  --discard) [ -n "${2:-}" ] || die 2 "uso: cop --discard JOB"; cmd_discard "$2"; exit 0 ;;
+  --version) echo "cop $COP_VERSION"; exit 0 ;;
+  --help) usage; exit 0 ;;
+esac
+
+# Evita que o Copilot (que também lê CLAUDE.md/AGENTS.md) chame o cop de novo.
+[ -z "${COP_ACTIVE:-}" ] || die 3 "chamada recursiva bloqueada: você já está dentro de uma delegação. Faça a tarefa diretamente."
+command -v copilot >/dev/null || die 127 "copilot não encontrado no PATH (brew install copilot-cli)"
+
+# ---------- opções ----------
+MODEL="${COP_MODEL:-gpt-6-luna}"
+EFFORT="${COP_EFFORT-low}"
+TIMEOUT="${COP_TIMEOUT:-540}"
+MAX_CHARS="${COP_MAX_CHARS:-4000}"
+MODE=read ROLE=worker WORKDIR="$PWD" USE_WT=0 RESUME=""
+MODEL_SET=0 MODE_SET=0 ROLE_SET=0 DIR_SET=0
+
+while getopts ":wWR:r:m:e:C:t:h" opt; do
+  case "$opt" in
+    w) MODE=write; MODE_SET=1 ;;
+    W) MODE=write; USE_WT=1; MODE_SET=1 ;;
+    R) ROLE="$OPTARG"; ROLE_SET=1 ;;
+    r) RESUME="$OPTARG" ;;
+    m) MODEL="$OPTARG"; MODEL_SET=1 ;;
+    e) EFFORT="$OPTARG" ;;
+    C) WORKDIR="$OPTARG"; DIR_SET=1 ;;
+    t) TIMEOUT="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) die 2 "a opção -$OPTARG precisa de um valor" ;;
+    *) usage >&2; die 2 "opção inválida: -$OPTARG" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+TASK="$*"
+if [ -z "$TASK" ] && [ ! -t 0 ]; then TASK="$(cat)"; fi
+[ -n "$TASK" ] || { usage >&2; exit 2; }
+
+case "$ROLE" in
+  worker|reviewer|tester) ;;
+  *) die 2 "papel inválido: $ROLE (use worker, reviewer ou tester)" ;;
+esac
+
+# Retomada: herda diretório, modo, papel e modelo do job (as opções explícitas vencem)
+SESSION="" REPO="" WT="" BRANCH=""
+if [ -n "$RESUME" ]; then
+  JF="$(resolve_job "$RESUME")"; . "$JF"
+  [ -n "$J_SESSION" ] || die 4 "o job $J_ID não tem sessão registrada"
+  SESSION="$J_SESSION"
+  [ "$DIR_SET" = 1 ] || WORKDIR="$J_WORKDIR"
+  [ "$MODE_SET" = 1 ] || MODE="$J_MODE"
+  [ "$ROLE_SET" = 1 ] || ROLE="$J_ROLE"
+  [ "$MODEL_SET" = 1 ] || MODEL="$J_MODEL"
+  REPO="$J_REPO" WT="$J_WORKTREE" BRANCH="$J_BRANCH"
+  [ "$USE_WT" = 1 ] && die 2 "-W não combina com -r (a retomada usa o diretório do job)"
+  [ -d "$WORKDIR" ] || die 4 "o diretório do job não existe mais: $WORKDIR"
+fi
+[ "$ROLE" = reviewer ] && MODE=read
+[ "$ROLE" = tester ] && MODE=write
+[ -d "$WORKDIR" ] || die 2 "diretório não existe: $WORKDIR"
+
+mkdir -p "$LOG_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+LOG="$LOG_DIR/$STAMP.md"
+RUN_DIR="$WORKDIR"
+
+# ---------- worktree ----------
+if [ "$USE_WT" = 1 ]; then
+  REPO="$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null)" || die 4 "-W precisa de um repositório git"
+  SUB="$(git -C "$WORKDIR" rev-parse --show-prefix)"
+  BRANCH="cop/$STAMP"
+  WT_BASE="${COP_WORKTREE_DIR:-$(dirname "$REPO")/.cop-worktrees}"
+  WT="$WT_BASE/$(basename "$REPO")-$STAMP"
+  mkdir -p "$WT_BASE"
+  git -C "$REPO" worktree add -q -b "$BRANCH" "$WT" HEAD || die 4 "falha ao criar o worktree"
+  RUN_DIR="$WT/$SUB"
+  if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
+    echo "[cop] aviso: o repositório tem mudanças não commitadas; o worktree parte do último commit (HEAD)."
+  fi
+fi
+
+# ---------- prompt e agente ----------
+AGENT="cop-$ROLE"
+AGENT_ARGS=()
+if [ -z "$SESSION" ]; then
+  if [ -f "$COPILOT_HOME_DIR/agents/$AGENT.agent.md" ]; then
+    AGENT_ARGS=(--agent "$AGENT")
+    PROMPT="$TASK"
+  elif [ "$ROLE" = worker ]; then
+    PROMPT="$TASK
+
+---
+Responda SOMENTE com um resumo de até 15 linhas: (1) o que foi feito, (2) arquivos alterados,
+(3) comandos rodados e resultado, (4) dúvidas ou riscos. Não cole arquivos nem diffs inteiros."
+  else
+    die 2 "o papel $ROLE precisa do agente $COPILOT_HOME_DIR/agents/$AGENT.agent.md (rode o install.sh)"
+  fi
+else
+  PROMPT="[CONTINUAÇÃO da tarefa anterior desta sessão]
+$TASK"
+fi
+[ "$MODE" = read ] && PROMPT="[MODO LEITURA: não altere nenhum arquivo]
+$PROMPT"
+[ "$USE_WT" = 1 ] && PROMPT="[Você está num git worktree novo: se precisar rodar testes, instale as dependências antes (ex.: fvm flutter pub get).]
+$PROMPT"
+
+# ---------- permissões (deny sempre vence allow) ----------
+DENY=(
+  'shell(git push:*)' 'shell(git reset:*)' 'shell(git clean:*)' 'shell(git checkout:*)'
+  'shell(git restore:*)' 'shell(git rebase:*)' 'shell(git commit:*)' 'shell(git stash:*)'
+  'shell(git worktree:*)' 'shell(git branch:*)' 'shell(git switch:*)' 'shell(git merge:*)'
+  'shell(rm:*)' 'shell(sudo:*)' 'shell(chmod:*)' 'shell(curl:*)' 'shell(wget:*)'
+  'shell(cop:*)' 'shell(copilot:*)' 'shell(claude:*)'
+  'write(.env)' 'write(**/.env*)' 'write(**/*.jks)' 'write(**/*.keystore)'
+)
+READ_ALLOW=(
+  'read'
+  'shell(ls:*)' 'shell(cat:*)' 'shell(head:*)' 'shell(tail:*)' 'shell(wc:*)' 'shell(find:*)'
+  'shell(grep:*)' 'shell(rg:*)' 'shell(tree:*)' 'shell(file:*)' 'shell(pwd)'
+  'shell(git status:*)' 'shell(git diff:*)' 'shell(git log:*)' 'shell(git show:*)'
+  'shell(git blame:*)' 'shell(git ls-files:*)'
+)
+RUN_ALLOW=(
+  'shell(flutter:*)' 'shell(fvm:*)' 'shell(dart:*)' 'shell(melos:*)' 'shell(very_good:*)'
+  'shell(npm:*)' 'shell(npx:*)' 'shell(pnpm:*)' 'shell(yarn:*)' 'shell(bun:*)' 'shell(node:*)'
+  'shell(python3:*)' 'shell(pytest:*)' 'shell(uv:*)' 'shell(make:*)'
+  'shell(mkdir:*)' 'shell(mv:*)' 'shell(cp:*)' 'shell(touch:*)' 'shell(git add:*)' 'shell(git mv:*)'
+)
+TEST_WRITE=(
+  'write(test/**)' 'write(**/test/**)' 'write(integration_test/**)' 'write(**/integration_test/**)'
+  'write(**/*_test.*)' 'write(**/*.test.*)' 'write(**/*.spec.*)' 'write(**/__tests__/**)'
+)
+
+ARGS=(--model "$MODEL" -s --stream off --no-ask-user --no-auto-update --max-autopilot-continues 20)
+[ -n "$EFFORT" ] && ARGS+=(--reasoning-effort "$EFFORT")
+[ "${COP_GITHUB_MCP:-0}" = 1 ] || ARGS+=(--disable-builtin-mcps)
+for p in "${DENY[@]}"; do ARGS+=("--deny-tool=$p"); done
+for p in "${READ_ALLOW[@]}"; do ARGS+=("--allow-tool=$p"); done
+if [ "$MODE" = write ]; then
+  if [ "$ROLE" = tester ]; then
+    for p in "${TEST_WRITE[@]}"; do ARGS+=("--allow-tool=$p"); done
+  else
+    ARGS+=("--allow-tool=write")
+  fi
+  for p in "${RUN_ALLOW[@]}"; do ARGS+=("--allow-tool=$p"); done
+  for p in ${COP_EXTRA_ALLOW:-}; do ARGS+=("--allow-tool=$p"); done
+else
+  ARGS+=("--deny-tool=write")
+fi
+
+# sessão: nova com UUID conhecido, ou retomada
+if [ -n "$SESSION" ]; then
+  ARGS+=(--resume "$SESSION")
+else
+  SESSION="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')"
+  SESSION="$(printf '%s' "$SESSION" | tr 'A-Z' 'a-z')"
+  ARGS+=(--session-id "$SESSION")
+fi
+ARGS+=(--usage-output-file "$LOG_DIR/$STAMP.usage.json")
+ARGS+=("${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}")
+
+# ---------- execução com timeout ----------
+START=$(date +%s)
+set +e
+(cd "$RUN_DIR" && COP_ACTIVE=1 COPILOT_AUTO_UPDATE=false exec copilot "${ARGS[@]}" -p "$PROMPT") >"$LOG" 2>&1 &
+PID=$!
+( sleep "$TIMEOUT" && kill -TERM "$PID" 2>/dev/null && echo timeout >"$LOG.timeout" ) >/dev/null 2>&1 &
+WATCHER=$!
+wait "$PID"; STATUS=$?
+pkill -P "$WATCHER" 2>/dev/null; kill "$WATCHER" 2>/dev/null; wait "$WATCHER" 2>/dev/null
+set -e
+[ -f "$LOG.timeout" ] && { STATUS=124; rm -f "$LOG.timeout"; echo "[cop] timeout de ${TIMEOUT}s" >>"$LOG"; }
+DURATION=$(( $(date +%s) - START ))
+
+save_job
+SHORT_TASK="$(printf '%s' "$TASK" | tr '\t\n' '  ' | cut -c1-100)"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$STAMP" "$MODE" "$MODEL" "$RUN_DIR" "$STATUS" "$DURATION" "$SHORT_TASK" "$ROLE" >>"$INDEX"
+
+# ---------- saída ----------
+SIZE=$(wc -c <"$LOG" | tr -d ' ')
+if [ "$SIZE" -gt "$MAX_CHARS" ]; then
+  echo "[cop] resposta com ${SIZE} caracteres; mostrando os últimos ${MAX_CHARS}."
+  tail -c "$MAX_CHARS" "$LOG"
+else
+  cat "$LOG"
+fi
+echo
+if [ -n "$WT" ] && [ -d "$WT" ]; then
+  git -C "$WT" add -A >/dev/null 2>&1 && git -C "$WT" diff --cached --stat HEAD | tail -15
+  echo "[cop] worktree: $WT  ·  aplicar: cop --apply $STAMP  ·  descartar: cop --discard $STAMP"
+fi
+echo "[cop] job=$STAMP status=$STATUS papel=$ROLE modo=$MODE modelo=$MODEL tempo=${DURATION}s log=$LOG"
+echo "[cop] continuar esta sessão: cop -r $STAMP \"<próximo passo>\""
+exit "$STATUS"

@@ -1,0 +1,11 @@
+{
+  "name": "copilot-delegate",
+  "displayName": "Copilot Delegate",
+  "version": "3.0.0",
+  "description": "Claude orquestra e delega trabalho mecânico ao GitHub Copilot CLI (gpt-6-luna) para economizar tokens.",
+  "author": { "name": "Pablo Stefan", "url": "https://github.com/pablostefan" },
+  "homepage": "https://github.com/pablostefan/claude-copilot-delegate",
+  "repository": "https://github.com/pablostefan/claude-copilot-delegate",
+  "license": "MIT",
+  "keywords": ["copilot", "delegation", "tokens", "cost"]
+}

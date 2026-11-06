@@ -1,0 +1,14 @@
+{
+  "name": "claude-copilot-delegate",
+  "owner": {
+    "name": "Pablo Stefan"
+  },
+  "description": "Claude Code orquestra, GitHub Copilot CLI executa: delegação de tarefas para economizar tokens.",
+  "plugins": [
+    {
+      "name": "copilot-delegate",
+      "source": "./plugins/copilot-delegate",
+      "description": "Delegação de tarefas ao GitHub Copilot CLI para economizar tokens do Claude."
+    }
+  ]
+}

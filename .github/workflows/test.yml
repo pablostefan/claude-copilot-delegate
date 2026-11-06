@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe dos scripts
+        run: bash -n plugins/copilot-delegate/bin/cop install.sh uninstall.sh tests/test_cop.sh
+      - name: JSON válido
+        run: |
+          for f in .claude-plugin/marketplace.json plugins/copilot-delegate/.claude-plugin/plugin.json settings/settings-economia.json; do
+            python3 -m json.tool "$f" >/dev/null && echo "ok $f"
+          done
+      - name: Testes do cop (copilot falso)
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+          bash tests/test_cop.sh

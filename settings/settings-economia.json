@@ -1,0 +1,33 @@
+{
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku",
+    "BASH_MAX_OUTPUT_LENGTH": "15000",
+    "MAX_MCP_OUTPUT_TOKENS": "10000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75",
+    "CLAUDE_CODE_GLOB_NO_IGNORE": "false",
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "false"
+  },
+  "autoCompactWindow": 200000,
+  "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "medium" }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cop *)",
+      "Bash(git diff *)",
+      "Bash(git status *)"
+    ],
+    "deny": [
+      "Read(**/build/**)",
+      "Read(**/.dart_tool/**)",
+      "Read(**/.fvm/**)",
+      "Read(**/Pods/**)",
+      "Read(**/node_modules/**)",
+      "Read(**/coverage/**)",
+      "Read(**/*.g.dart)",
+      "Read(**/*.freezed.dart)",
+      "Read(**/*.mocks.dart)",
+      "Read(**/*.min.js)"
+    ]
+  }
+}
